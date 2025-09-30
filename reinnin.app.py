@@ -1,571 +1,401 @@
-import os
-import sqlite3
-from datetime import datetime
-from typing import Dict, Any
+# re_game_app.py
+# Real Estate Portfolio Game — Madrid (50 fixed assets)
+#
+# Implements:
+# - 50 hardcoded Madrid assets (no randomness; deterministic)
+# - Initial cash: €10,000,000
+# - Whole-asset trades only (no partial sqm)
+# - Supply gating: an asset is unavailable while held; it returns to market only when sold
+# - Sale soft cap: 7% above entry €/sqm; exceeding it rejects the sale and blocks the asset until next week
+# - Weekly curveball announcements + numeric effects (W2, W4, W6, W7, W9, W12)
+# - Portfolio includes 'property name'
+# - Removed "ask the bot"; "Team name" -> "Name"
 
-import streamlit as st
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, List
+
 import pandas as pd
-import numpy as np
+import streamlit as st
 
-DB_PATH = "game.db"
-ADMIN_PASS = os.getenv("ADMIN_PASS", "1nn1n")
+# ---------------------------
+# Config
+# ---------------------------
+INITIAL_CASH = 10_000_000.0  # €10m budget
+SALE_SOFT_CAP_FACTOR = 1.07  # +7%
+START_WEEK = 1
+END_WEEK = 14
 
-# -------------------------
-# DB & seed data
-# -------------------------
+# ---------------------------
+# Data models
+# ---------------------------
+@dataclass
+class Asset:
+    asset_id: str
+    property_name: str
+    sector: str  # Residential, Office, Retail, Logistics
+    location: str  # Madrid
+    sqm: int
+    ask_psm: float  # current market ask €/sqm
+    erv_psm: float  # ERV €/sqm (income proxy)
+    opex_psm: float # Opex €/sqm
+    tax_psm: float  # IBI/taxes €/sqm
 
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+@dataclass
+class Holding:
+    asset_id: str
+    property_name: str
+    sector: str
+    location: str
+    sqm: int
+    entry_psm: float  # price per sqm paid
+    buy_week: int
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    # Teams
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS teams (
-        team_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        team_name TEXT UNIQUE NOT NULL,
-        cash REAL DEFAULT 50000000.0,
-        created_at TEXT
-    )""")
-    # Assets
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS assets (
-        asset_id TEXT PRIMARY KEY,
-        name TEXT,
-        sector TEXT,
-        subsector TEXT,
-        district TEXT,
-        size_sqm REAL,
-        year INTEGER,
-        condition TEXT,
-        vacancy REAL,
-        erv_psm_pm REAL,
-        rent_psm_pm REAL,
-        opex_psm_pa REAL,
-        capex_y1_pct REAL,
-        exp_capex_5y_psm REAL,
-        price_psm REAL,
-        status TEXT
-    )""")
-    # Assumptions
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS assumptions (
-        key TEXT PRIMARY KEY,
-        value REAL,
-        note TEXT
-    )""")
-    # Curveballs
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS curveballs (
-        week INTEGER PRIMARY KEY,
-        title TEXT,
-        rule TEXT
-    )""")
-    # Positions
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS positions (
-        position_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        team_id INTEGER,
-        asset_id TEXT,
-        size_sqm REAL,
-        price_psm REAL,
-        acq_cost_pct REAL,
-        ltv_pct REAL,
-        debt_draw REAL,
-        equity REAL,
-        opened_week INTEGER,
-        closed_week INTEGER,
-        notes TEXT,
-        FOREIGN KEY(team_id) REFERENCES teams(team_id),
-        FOREIGN KEY(asset_id) REFERENCES assets(asset_id)
-    )""")
-    # Transactions
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS transactions (
-        tx_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        team_id INTEGER,
-        week INTEGER,
-        asset_id TEXT,
-        kind TEXT,
-        cashflow REAL,
-        description TEXT,
-        created_at TEXT,
-        FOREIGN KEY(team_id) REFERENCES teams(team_id)
-    )""")
-    # Game state
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS game_state (
-        id INTEGER PRIMARY KEY CHECK (id=1),
-        current_week INTEGER,
-        max_ltv REAL
-    )""")
-    cur.execute("INSERT OR IGNORE INTO game_state (id, current_week, max_ltv) VALUES (1, 1, 0.60)")
-    # Weekly snapshots (locked scores)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS weekly_snapshots (
-        snap_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        week INTEGER,
-        team_name TEXT,
-        portfolio_value REAL,
-        equity REAL,
-        debt REAL,
-        ltv REAL,
-        noi REAL,
-        cash REAL,
-        created_at TEXT
-    )""")
-    conn.commit()
-    conn.close()
+# ---------------------------
+# Fixed catalog: 50 Madrid assets
+# ---------------------------
+# Notes on ranges used:
+# Residential ask €/sqm ~ 3,200–6,000
+# Office ~ 2,200–4,000
+# Retail ~ 1,800–3,500
+# Logistics ~ 1,400–2,400
+# ERV is approx 4%–7% of ask; opex 0.4%–0.9%; tax 0.3%–0.6%
+ASSETS_DATA: List[dict] = [
+    # Residential (12)
+    {"asset_id":"A001","property_name":"RES-MAD-SALAMAN-01","sector":"Residential","location":"Madrid","sqm":4200,"ask_psm":5200.0,"erv_psm":312.0,"opex_psm":31.2,"tax_psm":24.0},
+    {"asset_id":"A002","property_name":"RES-MAD-CHAMART-02","sector":"Residential","location":"Madrid","sqm":3500,"ask_psm":4800.0,"erv_psm":264.0,"opex_psm":24.0,"tax_psm":21.6},
+    {"asset_id":"A003","property_name":"RES-MAD-CHAMBER-03","sector":"Residential","location":"Madrid","sqm":3900,"ask_psm":5400.0,"erv_psm":291.6,"opex_psm":32.4,"tax_psm":27.0},
+    {"asset_id":"A004","property_name":"RES-MAD-CENTRO-04","sector":"Residential","location":"Madrid","sqm":2800,"ask_psm":5600.0,"erv_psm":308.0,"opex_psm":33.6,"tax_psm":28.0},
+    {"asset_id":"A005","property_name":"RES-MAD-RETIRO-05","sector":"Residential","location":"Madrid","sqm":3100,"ask_psm":5000.0,"erv_psm":285.0,"opex_psm":30.0,"tax_psm":25.0},
+    {"asset_id":"A006","property_name":"RES-MAD-TETUAN-06","sector":"Residential","location":"Madrid","sqm":4600,"ask_psm":3900.0,"erv_psm":195.0,"opex_psm":19.5,"tax_psm":15.6},
+    {"asset_id":"A007","property_name":"RES-MAD-ARGANZ-07","sector":"Residential","location":"Madrid","sqm":5200,"ask_psm":3600.0,"erv_psm":172.8,"opex_psm":18.0,"tax_psm":14.4},
+    {"asset_id":"A008","property_name":"RES-MAD-MONCLO-08","sector":"Residential","location":"Madrid","sqm":2700,"ask_psm":4700.0,"erv_psm":246.8,"opex_psm":23.5,"tax_psm":18.8},
+    {"asset_id":"A009","property_name":"RES-MAD-LATINA-09","sector":"Residential","location":"Madrid","sqm":6000,"ask_psm":3400.0,"erv_psm":163.2,"opex_psm":17.0,"tax_psm":13.6},
+    {"asset_id":"A010","property_name":"RES-MAD-CARABN-10","sector":"Residential","location":"Madrid","sqm":4800,"ask_psm":3200.0,"erv_psm":156.8,"opex_psm":14.4,"tax_psm":12.8},
+    {"asset_id":"A011","property_name":"RES-MAD-USERA-11","sector":"Residential","location":"Madrid","sqm":4200,"ask_psm":3300.0,"erv_psm":165.0,"opex_psm":14.9,"tax_psm":11.9},
+    {"asset_id":"A012","property_name":"RES-MAD-VALLEC-12","sector":"Residential","location":"Madrid","sqm":3800,"ask_psm":3500.0,"erv_psm":175.0,"opex_psm":15.8,"tax_psm":12.6},
 
-ASSETS = [
-    ("RES-MAD-001","Salamanca Prime Apt","Residential","Prime Apartment","Salamanca",110,2010,"Core",0.0,28.0,27.0,9.0*12,0.01,120.0,6500.0,"Stabilized"),
-    ("RES-MAD-002","Chamberí Rental Block (12u)","Residential","Multi-let","Chamberí",900,1968,"Value-Add",15.0,22.0,18.5,7.0*12,0.04,250.0,5200.0,"Leased"),
-    ("RES-MAD-003","Arganzuela Starter Units (20u)","Residential","BTR","Arganzuela",1600,2002,"Core+",8.0,18.0,16.0,6.0*12,0.02,150.0,4300.0,"Leased"),
-    ("OFF-MAD-001","CBD Castellana Office","Office","CBD","Chamartín",5200,1999,"Core",5.0,42.0,40.0,12.0*12,0.015,220.0,7200.0,"Leased"),
-    ("OFF-MAD-002","Decentralized Office (M-30)","Office","Periphery","Ciudad Lineal",7800,1985,"Value-Add",25.0,25.0,21.0,10.0*12,0.05,350.0,3500.0,"Partly Vacant"),
-    ("RET-MAD-001","Gran Vía Flagship Unit","Retail","High Street","Centro",950,2005,"Core",0.0,145.0,140.0,18.0*12,0.01,180.0,18000.0,"Leased"),
-    ("RET-MAD-002","Barrio Secondary Retail","Retail","Secondary","Tetuán",600,1990,"Opportunistic",40.0,20.0,12.0,8.0*12,0.07,300.0,2800.0,"Vacant/Leased mix"),
-    ("LOG-MAD-001","Getafe Logistics Box","Logistics","Big Box","Getafe",15400,2016,"Core+",0.0,6.1,6.0,3.5*12,0.01,80.0,980.0,"Leased"),
-    ("LOG-MAD-002","Alcalá Last-mile","Logistics","Last Mile","Alcalá de Henares",6200,2008,"Value-Add",20.0,6.5,5.5,3.0*12,0.03,120.0,900.0,"Partly Vacant"),
-    ("DEV-MAD-001","Valdebebas Residential Plot","Development","Resi Plot","Hortaleza",4500,None,"Land",100.0,None,0.0,0.0,0.0,0.0,400.0,"Land Bank"),
-    ("DEV-MAD-002","Usera Office-to-Resi","Development","Conversion","Usera",5200,1980,"Opportunistic",70.0,None,6.0,9.0*12,0.10,600.0,1800.0,"Conversion Candidate"),
+    # Office (12)
+    {"asset_id":"A013","property_name":"OFF-MAD-SALAMAN-13","sector":"Office","location":"Madrid","sqm":7200,"ask_psm":3800.0,"erv_psm":209.0,"opex_psm":27.4,"tax_psm":19.0},
+    {"asset_id":"A014","property_name":"OFF-MAD-CHAMART-14","sector":"Office","location":"Madrid","sqm":6500,"ask_psm":3600.0,"erv_psm":201.6,"opex_psm":25.2,"tax_psm":18.0},
+    {"asset_id":"A015","property_name":"OFF-MAD-CHAMBER-15","sector":"Office","location":"Madrid","sqm":5400,"ask_psm":3400.0,"erv_psm":176.8,"opex_psm":22.1,"tax_psm":15.3},
+    {"asset_id":"A016","property_name":"OFF-MAD-CENTRO-16","sector":"Office","location":"Madrid","sqm":4800,"ask_psm":4000.0,"erv_psm":220.0,"opex_psm":28.0,"tax_psm":22.0},
+    {"asset_id":"A017","property_name":"OFF-MAD-RETIRO-17","sector":"Office","location":"Madrid","sqm":5100,"ask_psm":3500.0,"erv_psm":189.0,"opex_psm":21.9,"tax_psm":17.5},
+    {"asset_id":"A018","property_name":"OFF-MAD-TETUAN-18","sector":"Office","location":"Madrid","sqm":6900,"ask_psm":3000.0,"erv_psm":162.0,"opex_psm":18.0,"tax_psm":14.4},
+    {"asset_id":"A019","property_name":"OFF-MAD-ARGANZ-19","sector":"Office","location":"Madrid","sqm":5600,"ask_psm":2900.0,"erv_psm":156.6,"opex_psm":17.4,"tax_psm":13.1},
+    {"asset_id":"A020","property_name":"OFF-MAD-MONCLO-20","sector":"Office","location":"Madrid","sqm":4300,"ask_psm":3200.0,"erv_psm":166.4,"opex_psm":20.5,"tax_psm":14.4},
+    {"asset_id":"A021","property_name":"OFF-MAD-LATINA-21","sector":"Office","location":"Madrid","sqm":4700,"ask_psm":2800.0,"erv_psm":145.6,"opex_psm":17.4,"tax_psm":12.3},
+    {"asset_id":"A022","property_name":"OFF-MAD-CARABN-22","sector":"Office","location":"Madrid","sqm":6200,"ask_psm":2600.0,"erv_psm":135.2,"opex_psm":16.1,"tax_psm":11.7},
+    {"asset_id":"A023","property_name":"OFF-MAD-USERA-23","sector":"Office","location":"Madrid","sqm":5800,"ask_psm":2500.0,"erv_psm":127.5,"opex_psm":15.0,"tax_psm":11.3},
+    {"asset_id":"A024","property_name":"OFF-MAD-VALLEC-24","sector":"Office","location":"Madrid","sqm":5000,"ask_psm":2400.0,"erv_psm":124.8,"opex_psm":14.4,"tax_psm":10.8},
+
+    # Retail (13)
+    {"asset_id":"A025","property_name":"RET-MAD-SALAMAN-25","sector":"Retail","location":"Madrid","sqm":3000,"ask_psm":3300.0,"erv_psm":181.5,"opex_psm":23.1,"tax_psm":16.5},
+    {"asset_id":"A026","property_name":"RET-MAD-CHAMART-26","sector":"Retail","location":"Madrid","sqm":2600,"ask_psm":3200.0,"erv_psm":172.8,"opex_psm":21.1,"tax_psm":16.0},
+    {"asset_id":"A027","property_name":"RET-MAD-CHAMBER-27","sector":"Retail","location":"Madrid","sqm":2400,"ask_psm":3100.0,"erv_psm":167.4,"opex_psm":22.3,"tax_psm":14.9},
+    {"asset_id":"A028","property_name":"RET-MAD-CENTRO-28","sector":"Retail","location":"Madrid","sqm":2800,"ask_psm":3500.0,"erv_psm":210.0,"opex_psm":24.5,"tax_psm":19.3},
+    {"asset_id":"A029","property_name":"RET-MAD-RETIRO-29","sector":"Retail","location":"Madrid","sqm":2200,"ask_psm":2900.0,"erv_psm":159.3,"opex_psm":20.3,"tax_psm":14.5},
+    {"asset_id":"A030","property_name":"RET-MAD-TETUAN-30","sector":"Retail","location":"Madrid","sqm":3600,"ask_psm":2300.0,"erv_psm":115.0,"opex_psm":18.4,"tax_psm":11.5},
+    {"asset_id":"A031","property_name":"RET-MAD-ARGANZ-31","sector":"Retail","location":"Madrid","sqm":4100,"ask_psm":2000.0,"erv_psm":100.0,"opex_psm":16.0,"tax_psm":10.0},
+    {"asset_id":"A032","property_name":"RET-MAD-MONCLO-32","sector":"Retail","location":"Madrid","sqm":2700,"ask_psm":2700.0,"erv_psm":145.8,"opex_psm":18.9,"tax_psm":13.5},
+    {"asset_id":"A033","property_name":"RET-MAD-LATINA-33","sector":"Retail","location":"Madrid","sqm":3900,"ask_psm":2100.0,"erv_psm":105.0,"opex_psm":16.8,"tax_psm":11.0},
+    {"asset_id":"A034","property_name":"RET-MAD-CARABN-34","sector":"Retail","location":"Madrid","sqm":3200,"ask_psm":2400.0,"erv_psm":122.4,"opex_psm":19.2,"tax_psm":12.0},
+    {"asset_id":"A035","property_name":"RET-MAD-USERA-35","sector":"Retail","location":"Madrid","sqm":3500,"ask_psm":2200.0,"erv_psm":118.8,"opex_psm":17.6,"tax_psm":11.0},
+    {"asset_id":"A036","property_name":"RET-MAD-VALLEC-36","sector":"Retail","location":"Madrid","sqm":2300,"ask_psm":1800.0,"erv_psm":108.0,"opex_psm":14.4,"tax_psm":9.9},
+    {"asset_id":"A037","property_name":"RET-MAD-MORATAL-37","sector":"Retail","location":"Madrid","sqm":2500,"ask_psm":2500.0,"erv_psm":137.5,"opex_psm":17.5,"tax_psm":12.5},
+
+    # Logistics (13)
+    {"asset_id":"A038","property_name":"LOG-MAD-VICLVAR-38","sector":"Logistics","location":"Madrid","sqm":9000,"ask_psm":2100.0,"erv_psm":115.5,"opex_psm":15.8,"tax_psm":12.6},
+    {"asset_id":"A039","property_name":"LOG-MAD-SANBLA-39","sector":"Logistics","location":"Madrid","sqm":11000,"ask_psm":2000.0,"erv_psm":110.0,"opex_psm":15.0,"tax_psm":12.0},
+    {"asset_id":"A040","property_name":"LOG-MAD-BARAJAS-40","sector":"Logistics","location":"Madrid","sqm":8000,"ask_psm":2200.0,"erv_psm":121.0,"opex_psm":16.5,"tax_psm":13.2},
+    {"asset_id":"A041","property_name":"LOG-MAD-VALLEC-41","sector":"Logistics","location":"Madrid","sqm":10000,"ask_psm":1800.0,"erv_psm":102.6,"opex_psm":14.4,"tax_psm":10.8},
+    {"asset_id":"A042","property_name":"LOG-MAD-VILLVER-42","sector":"Logistics","location":"Madrid","sqm":9500,"ask_psm":1750.0,"erv_psm":96.3,"opex_psm":14.0,"tax_psm":10.5},
+    {"asset_id":"A043","property_name":"LOG-MAD-HORTALZ-43","sector":"Logistics","location":"Madrid","sqm":7800,"ask_psm":1950.0,"erv_psm":107.3,"opex_psm":15.6,"tax_psm":11.7},
+    {"asset_id":"A044","property_name":"LOG-MAD-CIU-LIN-44","sector":"Logistics","location":"Madrid","sqm":8200,"ask_psm":1900.0,"erv_psm":104.5,"opex_psm":15.2,"tax_psm":11.4},
+    {"asset_id":"A045","property_name":"LOG-MAD-USERA-45","sector":"Logistics","location":"Madrid","sqm":7000,"ask_psm":1700.0,"erv_psm":93.5,"opex_psm":13.6,"tax_psm":10.2},
+    {"asset_id":"A046","property_name":"LOG-MAD-TETUAN-46","sector":"Logistics","location":"Madrid","sqm":7500,"ask_psm":1650.0,"erv_psm":90.8,"opex_psm":13.2,"tax_psm":9.9},
+    {"asset_id":"A047","property_name":"LOG-MAD-ARGANZ-47","sector":"Logistics","location":"Madrid","sqm":8200,"ask_psm":1600.0,"erv_psm":88.0,"opex_psm":12.8,"tax_psm":9.6},
+    {"asset_id":"A048","property_name":"LOG-MAD-MONCLO-48","sector":"Logistics","location":"Madrid","sqm":8800,"ask_psm":1850.0,"erv_psm":103.7,"opex_psm":14.8,"tax_psm":11.1},
+    {"asset_id":"A049","property_name":"LOG-MAD-LATINA-49","sector":"Logistics","location":"Madrid","sqm":9600,"ask_psm":1500.0,"erv_psm":82.5,"opex_psm":12.0,"tax_psm":9.0},
+    {"asset_id":"A050","property_name":"LOG-MAD-CARABN-50","sector":"Logistics","location":"Madrid","sqm":10400,"ask_psm":1450.0,"erv_psm":78.3,"opex_psm":11.6,"tax_psm":8.7},
 ]
 
-ASSUMPTIONS = [
-    ("Inflation_%", 2.0, "CPI baseline"),
-    ("Rent_Growth_Base_%", 3.0, "Annual rent growth base"),
-    ("Opex_Growth_%", 2.0, "Annual opex growth"),
-    ("Exit_Yield_Residential_%", 4.25, "Exit cap"),
-    ("Exit_Yield_Office_%", 4.70, "Exit cap"),
-    ("Exit_Yield_Retail_%", 4.50, "Exit cap"),
-    ("Exit_Yield_Logistics_%", 5.25, "Exit cap"),
-    ("Euribor12M_%", 2.2, "12M Euribor base"),
-    ("Loan_Spread_bp", 180.0, "bps over Euribor"),
-    ("Max_LTV_%", 60.0, "Max LTV"),
-]
+def load_assets() -> Dict[str, Asset]:
+    assets: Dict[str, Asset] = {}
+    for row in ASSETS_DATA:
+        assets[row["asset_id"]] = Asset(**row)
+    return assets
 
-CURVEBALLS = [
-    (1, "Kickoff: +25bp rates", "Euribor12M_% += 0.25"),
-    (2, "Retail softness", "Retail secondary ERV -5%"),
-    (3, "LP pushes opportunistic", ">=20% VA/Opp by W4"),
-    (4, "Bidding war", "+7% on asks"),
-    (5, "FX wobble", "Info only"),
-    (6, "IBI/tax re-rate", "NOI -3%"),
-    (7, "Tenant bankruptcy", "+20% vacancy"),
-    (8, "Bank tightens", "Max LTV 55%"),
-    (9, "Energy spike", "+12% opex"),
-    (10, "PropTech incentive", "+10% retention"),
-    (11, "Benchmarking bonus", "Top quartile bonus"),
-    (12, "Resi demand +2% ERV growth", "+2% resi ERV"),
-    (13, "Green subsidy", "30% capex rebate"),
-    (14, "Final valuation", "Freeze & score"),
-]
+# ---------------------------
+# Curveballs (announcements + numeric effects)
+# ---------------------------
+CURVEBALLS: Dict[int, str] = {
+    1: "+25 bps interest rate shock (financing more expensive)",
+    2: "Retail softness: secondary retail ERVs drop",
+    3: "LP mandate: >=20% allocation to Value-Add/Opportunistic by Week 4",
+    4: "Bidding war: asking prices +7% pressure",
+    5: "FX wobble: noise only; no direct P&L impact",
+    6: "IBI/tax re-rate: NOI -3% pressure",
+    7: "Tenant bankruptcy: vacancy risk spikes (effective ERV -20%)",
+    8: "Bank tightens: Max LTV 55% (if using debt module)",
+    9: "Energy spike: opex +12% pressure",
+    10: "PropTech incentive: retention +10%",
+    11: "Benchmarking bonus: top quartile rewarded",
+    12: "Residential demand: ERV growth +2%",
+    13: "Green subsidy: 30% rebate on capex",
+    14: "Freeze & score: final valuations",
+}
 
-def seed_data():
-    conn = get_conn()
-    cur = conn.cursor()
-    for row in ASSETS:
-        cur.execute("""
-        INSERT OR IGNORE INTO assets (asset_id,name,sector,subsector,district,size_sqm,year,condition,vacancy,erv_psm_pm,rent_psm_pm,opex_psm_pa,capex_y1_pct,exp_capex_5y_psm,price_psm,status)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, row)
-    for key, val, note in ASSUMPTIONS:
-        cur.execute("INSERT OR IGNORE INTO assumptions (key,value,note) VALUES (?,?,?)", (key, val, note))
-    for row in CURVEBALLS:
-        cur.execute("INSERT OR IGNORE INTO curveballs (week,title,rule) VALUES (?,?,?)", row)
-    conn.commit(); conn.close()
+def apply_curveball_effects(week: int):
+    """Apply numeric effects exactly once per week."""
+    applied = st.session_state.get("applied_curveballs", set())
+    if week in applied:
+        return
 
-# -------------------------
-# Helpers & queries
-# -------------------------
+    assets = st.session_state.assets
 
-def get_assumption(key: str) -> float:
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT value FROM assumptions WHERE key=?", conn, params=(key,))
-    conn.close()
-    return float(df.iloc[0,0]) if len(df) else np.nan
+    if week == 2:
+        # Retail softness: ERV -5% for Retail
+        for a in assets.values():
+            if a.sector == "Retail":
+                a.erv_psm = round(a.erv_psm * 0.95, 2)
+    elif week == 4:
+        # Bidding war: asking +7% for assets currently in market (not held)
+        held_ids = set(st.session_state.portfolio.keys())
+        for a in assets.values():
+            if a.asset_id not in held_ids:
+                a.ask_psm = round(a.ask_psm * 1.07, 2)
+    elif week == 6:
+        # IBI/tax re-rate: taxes +3% for all
+        for a in assets.values():
+            a.tax_psm = round(a.tax_psm * 1.03, 2)
+    elif week == 7:
+        # Tenant bankruptcy shock: effective ERV -20% for Office & Retail
+        for a in assets.values():
+            if a.sector in ("Office", "Retail"):
+                a.erv_psm = round(a.erv_psm * 0.80, 2)
+    elif week == 9:
+        # Energy spike: opex +12% for all
+        for a in assets.values():
+            a.opex_psm = round(a.opex_psm * 1.12, 2)
+    elif week == 12:
+        # Residential demand: ERV +2% for Residential
+        for a in assets.values():
+            if a.sector == "Residential":
+                a.erv_psm = round(a.erv_psm * 1.02, 2)
 
-def set_assumption(key: str, value: float):
-    conn = get_conn(); conn.execute("UPDATE assumptions SET value=? WHERE key=?", (value, key)); conn.commit(); conn.close()
+    applied.add(week)
+    st.session_state.applied_curveballs = applied
 
-def get_game_week() -> int:
-    conn = get_conn(); df = pd.read_sql_query("SELECT current_week FROM game_state WHERE id=1", conn); conn.close(); return int(df.iloc[0,0])
+# ---------------------------
+# State init
+# ---------------------------
+def init_state():
+    if "assets" not in st.session_state:
+        st.session_state.assets: Dict[str, Asset] = load_assets()
+    if "portfolio" not in st.session_state:
+        st.session_state.portfolio: Dict[str, Holding] = {}
+    if "cash" not in st.session_state:
+        st.session_state.cash = INITIAL_CASH
+    if "current_week" not in st.session_state:
+        st.session_state.current_week = START_WEEK
+    if "sale_blocks" not in st.session_state:
+        st.session_state.sale_blocks: Dict[str, int] = {}
+    if "name" not in st.session_state:
+        st.session_state.name = ""
+    if "applied_curveballs" not in st.session_state:
+        st.session_state.applied_curveballs = set()
 
-def set_game_week(week: int):
-    conn = get_conn(); conn.execute("UPDATE game_state SET current_week=? WHERE id=1", (week,)); conn.commit(); conn.close()
+# Helpers for sale block (soft cap rejection)
+def is_blocked(asset_id: str) -> bool:
+    blocked_until = st.session_state.sale_blocks.get(asset_id)
+    return blocked_until is not None and st.session_state.current_week < blocked_until
 
-def get_max_ltv() -> float:
-    conn = get_conn(); df = pd.read_sql_query("SELECT max_ltv FROM game_state WHERE id=1", conn); conn.close(); return float(df.iloc[0,0])
+def block_until_next_week(asset_id: str):
+    st.session_state.sale_blocks[asset_id] = st.session_state.current_week + 1
 
-def set_max_ltv(v: float):
-    conn = get_conn(); conn.execute("UPDATE game_state SET max_ltv=? WHERE id=1", (v,)); conn.commit(); conn.close()
+def clear_block(asset_id: str):
+    st.session_state.sale_blocks.pop(asset_id, None)
 
-def list_assets() -> pd.DataFrame:
-    conn = get_conn(); df = pd.read_sql_query("SELECT * FROM assets", conn); conn.close(); return df
+# ---------------------------
+# UI components
+# ---------------------------
+def header():
+    st.title("Real Estate Portfolio Game — Madrid (50 Assets)")
+    col1, col2, col3 = st.columns([1.6, 1, 1])
+    with col1:
+        st.text_input("Name", key="name", placeholder="Team / Player")
+    with col2:
+        st.metric("Week", st.session_state.current_week)
+    with col3:
+        st.metric("Cash (€)", f"{st.session_state.cash:,.0f}")
 
-def get_team(team_name: str) -> Dict[str, Any]:
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM teams WHERE team_name=?", conn, params=(team_name,))
-    if len(df) == 0:
-        conn.execute("INSERT INTO teams (team_name, cash, created_at) VALUES (?,?,?)", (team_name, 50000000.0, datetime.utcnow().isoformat()))
-        conn.commit()
-        df = pd.read_sql_query("SELECT * FROM teams WHERE team_name=?", conn, params=(team_name,))
-    conn.close()
-    return df.iloc[0].to_dict()
+    # Weekly announcement banner
+    cb = CURVEBALLS.get(st.session_state.current_week)
+    if cb:
+        st.info(f"**This week’s curveball:** {cb}")
 
-def list_team_positions(team_id: int) -> pd.DataFrame:
-    conn = get_conn(); df = pd.read_sql_query("SELECT * FROM positions WHERE team_id=? AND closed_week IS NULL", conn, params=(team_id,)); conn.close(); return df
+def market_view():
+    st.subheader("Market — Madrid")
+    # Asset is available if NOT currently held
+    held_ids = set(st.session_state.portfolio.keys())
 
-def list_all_positions() -> pd.DataFrame:
-    conn = get_conn()
-    df = pd.read_sql_query(
-        """
-        SELECT p.*, t.team_name
-        FROM positions p JOIN teams t ON p.team_id=t.team_id
-        WHERE p.closed_week IS NULL
-        ORDER BY t.team_name, p.opened_week
-        """, conn)
-    conn.close(); return df
-
-def list_transactions(limit: int = 200) -> pd.DataFrame:
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM transactions ORDER BY created_at DESC LIMIT ?", conn, params=(limit,))
-    conn.close(); return df
-
-# -------------------------
-# Market valuation band
-# -------------------------
-
-def get_market_price_band(asset_id: str) -> Dict[str, float]:
-    """Compute a market exit €/sqm band from NOI/cap and curveballs."""
-    conn = get_conn()
-    a = pd.read_sql_query("SELECT * FROM assets WHERE asset_id=?", conn, params=(asset_id,)).iloc[0]
-    conn.close()
-    y_map = {
-        "Residential": get_assumption("Exit_Yield_Residential_%")/100.0,
-        "Office": get_assumption("Exit_Yield_Office_%")/100.0,
-        "Retail": get_assumption("Exit_Yield_Retail_%")/100.0,
-        "Logistics": get_assumption("Exit_Yield_Logistics_%")/100.0,
-        "Development": 0.08,  # placeholder for dev (yield on cost normally)
-    }
-    cap = y_map.get(a["sector"], 0.05)
-    occ = 1.0 - float(a["vacancy"]) / 100.0
-    rent = (a["rent_psm_pm"] if pd.notnull(a["rent_psm_pm"]) else (a["erv_psm_pm"] or 0.0))
-    ibicut = 0.03 if get_game_week() >= 6 else 0.0  # week 6 tax hit
-    noi_psm = max(occ * (rent * 12.0) - a["opex_psm_pa"], 0.0) * (1.0 - ibicut)
-    fair_psm = noi_psm / cap if cap > 0 else float(a["price_psm"])
-    # curveball adjustments
-    week = get_game_week()
-    mult = 1.0
-    if week >= 2 and a["sector"] == "Retail" and a["subsector"] == "Secondary":
-        mult *= 0.95
-    if week >= 4:
-        mult *= 1.07
-    if week >= 12 and a["sector"] == "Residential":
-        mult *= 1.02
-    lower = fair_psm * 0.90 * mult
-    upper = fair_psm * 1.10 * mult
-    ask = float(a["price_psm"]) if pd.notnull(a["price_psm"]) else fair_psm
-    hard_low = min(ask, fair_psm) * 0.5
-    hard_up = max(ask, fair_psm) * 1.5
-    return {"lower": max(lower, hard_low), "upper": min(upper, hard_up), "fair": fair_psm}
-
-# -------------------------
-# Trading
-# -------------------------
-
-def buy_asset(team_id: int, asset_id: str, size_sqm: float, price_psm: float, acq_cost_pct: float, ltv_pct: float):
-    if ltv_pct > get_max_ltv():
-        st.error(f"Max LTV exceeded. Max: {get_max_ltv()*100:.0f}%"); return
-    gross = size_sqm * price_psm
-    acq_costs = gross * acq_cost_pct
-    debt_draw = gross * ltv_pct
-    equity = gross + acq_costs - debt_draw
-    conn = get_conn(); cur = conn.cursor()
-    cash = pd.read_sql_query("SELECT cash FROM teams WHERE team_id=?", conn, params=(team_id,)).iloc[0,0]
-    if equity > cash:
-        st.error("Insufficient cash."); conn.close(); return
-    week = get_game_week()
-    cur.execute("""
-        INSERT INTO positions (team_id, asset_id, size_sqm, price_psm, acq_cost_pct, ltv_pct, debt_draw, equity, opened_week)
-        VALUES (?,?,?,?,?,?,?,?,?)
-    """, (team_id, asset_id, size_sqm, price_psm, acq_cost_pct, ltv_pct, debt_draw, equity, week))
-    cur.execute("UPDATE teams SET cash=cash-? WHERE team_id=?", (equity, team_id))
-    cur.execute("INSERT INTO transactions (team_id, week, asset_id, kind, cashflow, description, created_at) VALUES (?,?,?,?,?,?,?)",
-                (team_id, week, asset_id, "BUY", -equity, f"Buy {asset_id} {size_sqm} sqm @ {price_psm}/sqm", datetime.utcnow().isoformat()))
-    conn.commit(); conn.close(); st.success("Asset purchased.")
-
-def sell_position(position_id: int, exit_price_psm: float):
-    conn = get_conn()
-    cur = conn.cursor()
-    pos = pd.read_sql_query("SELECT * FROM positions WHERE position_id=?", conn, params=(position_id,)).iloc[0]
-    week = get_game_week()
-    band = get_market_price_band(pos["asset_id"])
-    if exit_price_psm < band["lower"] or exit_price_psm > band["upper"]:
-        adj = min(max(exit_price_psm, band["lower"]), band["upper"])
-        st.warning(f"Exit price adjusted to market band: {adj:,.0f} €/sqm (allowed {band['lower']:,.0f}–{band['upper']:,.0f}; fair ~ {band['fair']:,.0f})")
-        exit_price_psm = adj
-    gross = pos["size_sqm"] * exit_price_psm
-    costs = gross * 0.02  # selling costs
-    proceeds = gross - costs
-    equity_back = proceeds - pos["debt_draw"]
-    cur.execute("UPDATE teams SET cash=cash+? WHERE team_id=?", (equity_back, pos["team_id"]))
-    cur.execute("UPDATE positions SET closed_week=? WHERE position_id=?", (week, position_id))
-    cur.execute("INSERT INTO transactions (team_id, week, asset_id, kind, cashflow, description, created_at) VALUES (?,?,?,?,?,?,?)",
-                (pos["team_id"], week, pos["asset_id"], "SELL", equity_back, f"Sell {pos['asset_id']} @ {exit_price_psm}/sqm", datetime.utcnow().isoformat()))
-    conn.commit(); conn.close(); st.success("Position sold.")
-
-# -------------------------
-# KPIs & Leaderboard
-# -------------------------
-
-def compute_kpis(team_id: int) -> Dict[str, float]:
-    conn = get_conn()
-    positions = pd.read_sql_query("SELECT * FROM positions WHERE team_id=? AND closed_week IS NULL", conn, params=(team_id,))
-    assets = pd.read_sql_query("SELECT * FROM assets", conn).set_index("asset_id")
-    y_map = {
-        "Residential": get_assumption("Exit_Yield_Residential_%")/100.0,
-        "Office": get_assumption("Exit_Yield_Office_%")/100.0,
-        "Retail": get_assumption("Exit_Yield_Retail_%")/100.0,
-        "Logistics": get_assumption("Exit_Yield_Logistics_%")/100.0,
-        "Development": 0.08,
-    }
-    ibicut = 0.03 if get_game_week() >= 6 else 0.0
-    total_value = total_debt = total_noi = 0.0
-    for _, pos in positions.iterrows():
-        a = assets.loc[pos["asset_id"]]
-        occ = 1.0 - float(a["vacancy"]) / 100.0
-        rent = (a["rent_psm_pm"] if pd.notnull(a["rent_psm_pm"]) else (a["erv_psm_pm"] or 0.0))
-        noi = pos["size_sqm"] * (occ * (rent*12.0) - a["opex_psm_pa"]) * (1.0 - ibicut)
-        cap = y_map.get(a["sector"], 0.05)
-        value = noi / cap if cap>0 else pos["size_sqm"] * (float(a["price_psm"]) if pd.notnull(a["price_psm"]) else 0.0)
-        total_noi += max(noi, 0.0)
-        total_value += max(value, 0.0)
-        total_debt += pos["debt_draw"]
-    cash = pd.read_sql_query("SELECT cash FROM teams WHERE team_id=?", conn, params=(team_id,)).iloc[0,0]
-    conn.close()
-    equity = total_value + cash - total_debt
-    ltv = 0.0 if total_value == 0 else total_debt/total_value
-    return {"portfolio_value": total_value + cash, "equity": equity, "debt": total_debt, "ltv": ltv, "noi": total_noi, "cash": cash}
-
-def compute_all_kpis() -> pd.DataFrame:
-    conn = get_conn(); teams = pd.read_sql_query("SELECT * FROM teams", conn); conn.close()
     rows = []
-    for _, t in teams.iterrows():
-        k = compute_kpis(int(t.team_id))
-        rows.append({"team_name": t.team_name, **k})
-    df = pd.DataFrame(rows).sort_values("equity", ascending=False)
-    return df
+    for a in st.session_state.assets.values():
+        available = a.asset_id not in held_ids
+        rows.append({
+            "asset_id": a.asset_id,
+            "property_name": a.property_name,
+            "sector": a.sector,
+            "location": a.location,
+            "sqm": a.sqm,
+            "ask_psm": a.ask_psm,
+            "available": "Yes" if available else "Held",
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True)
 
-# -------------------------
-# Snapshots (weekly lock)
-# -------------------------
+def portfolio_view():
+    st.subheader("Portfolio (Open Positions)")
+    if not st.session_state.portfolio:
+        st.caption("No holdings yet.")
+        return
+    rows = []
+    for h in st.session_state.portfolio.values():
+        rows.append({
+            "asset_id": h.asset_id,
+            "property_name": h.property_name,
+            "sector": h.sector,
+            "location": h.location,
+            "sqm": h.sqm,
+            "entry_psm": h.entry_psm,
+            "buy_week": h.buy_week,
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True)
 
-def take_weekly_snapshot():
-    week = get_game_week()
-    now = datetime.utcnow().isoformat()
-    df = compute_all_kpis()
-    if df.empty:
-        return 0
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM weekly_snapshots WHERE week=?", (week,))
-    for _, row in df.iterrows():
-        cur.execute("""
-            INSERT INTO weekly_snapshots (week, team_name, portfolio_value, equity, debt, ltv, noi, cash, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?)
-        """, (int(week), str(row["team_name"]), float(row["portfolio_value"]), float(row["equity"]),
-              float(row["debt"]), float(row["ltv"]), float(row["noi"]), float(row["cash"]), now))
-    conn.commit(); conn.close()
-    return len(df)
+def buy_view():
+    st.subheader("Buy Asset (whole-asset only) — Madrid")
 
-def load_snapshots(week: int = None) -> pd.DataFrame:
-    conn = get_conn()
-    if week is None:
-        df = pd.read_sql_query("SELECT * FROM weekly_snapshots ORDER BY week DESC, equity DESC", conn)
-    else:
-        df = pd.read_sql_query("SELECT * FROM weekly_snapshots WHERE week=? ORDER BY equity DESC", conn, params=(week,))
-    conn.close()
-    return df
+    held_ids = set(st.session_state.portfolio.keys())
+    available_assets = [a for a in st.session_state.assets.values() if a.asset_id not in held_ids]
+    if not available_assets:
+        st.warning("No assets are available right now. Sell something to release supply.")
+        return
 
-# -------------------------
-# Q&A helper
-# -------------------------
+    choices = {f"{a.asset_id} — {a.property_name} ({a.sector}, {a.location})": a.asset_id for a in available_assets}
+    label = st.selectbox("Select asset", options=list(choices.keys()))
+    asset = st.session_state.assets[choices[label]]
 
-def qa_answer(question: str) -> str:
-    q = question.lower()
-    df = list_assets()
-    hits = df[df.apply(lambda r: any(tok in str(r.values).lower() for tok in q.split()), axis=1)]
-    if not hits.empty:
-        r = hits.iloc[0]
-        return (
-            f"Asset {r.asset_id} — {r.name}\n"
-            f"Sector: {r.sector}/{r.subsector}, District: {r.district}\n"
-            f"Size: {r.size_sqm:.0f} sqm, Vacancy: {r.vacancy:.1f}%\n"
-            f"Rents: ERV {r.erv_psm_pm or r.rent_psm_pm} €/sqm/mo, Current {r.rent_psm_pm} €/sqm/mo\n"
-            f"Opex: {r.opex_psm_pa:.1f} €/sqm/yr, Price ask: {r.price_psm:.0f} €/sqm\n"
-            f"Condition: {r.condition}, Status: {r.status}"
+    st.write(f"**{asset.property_name}** — {asset.sector} in {asset.location}")
+    st.write(f"Size: **{asset.sqm:,} sqm** | Ask: **€{asset.ask_psm:,.2f}/sqm** | Ticket: **€{asset.sqm * asset.ask_psm:,.0f}**")
+
+    ticket = asset.sqm * asset.ask_psm
+
+    if ticket > st.session_state.cash:
+        st.error("Insufficient cash to buy this asset.")
+        return
+
+    if st.button("Buy (whole asset)"):
+        st.session_state.cash -= ticket
+        st.session_state.portfolio[asset.asset_id] = Holding(
+            asset_id=asset.asset_id,
+            property_name=asset.property_name,
+            sector=asset.sector,
+            location=asset.location,
+            sqm=asset.sqm,
+            entry_psm=asset.ask_psm,
+            buy_week=st.session_state.current_week,
         )
-    if "ltv" in q:
-        return f"Max LTV is {get_max_ltv()*100:.0f}%."
-    if "yield" in q or "cap" in q:
-        return "Cap value ≈ NOI / Exit Yield."
-    if "buy" in q:
-        return "Use the Trade tab: choose asset, size, price, costs, LTV → Buy."
-    return "Try searching by asset code/name, or ask about LTV/yield/how to buy."
+        st.success(f"Bought **{asset.property_name}** for €{ticket:,.0f}.")
 
-# -------------------------
-# UI
-# -------------------------
+def sell_view():
+    st.subheader("Sell Asset (whole-asset only) — Madrid")
 
+    if not st.session_state.portfolio:
+        st.caption("No holdings to sell.")
+        return
+
+    labels = {f"{h.asset_id} — {h.property_name} ({h.sector}, {h.location})": h.asset_id for h in st.session_state.portfolio.values()}
+    label = st.selectbox("Select holding", options=list(labels.keys()))
+    holding = st.session_state.portfolio[labels[label]]
+
+    max_exit_this_week = round(holding.entry_psm * SALE_SOFT_CAP_FACTOR, 2)
+
+    if is_blocked(holding.asset_id):
+        st.warning(f"Sale for this asset is blocked until week {st.session_state.sale_blocks[holding.asset_id]} due to exceeding last week's cap.")
+        return
+
+    st.write(f"**Max exit this week:** €{max_exit_this_week:,.2f}/sqm (7% over your entry €{holding.entry_psm:,.2f}/sqm)")
+
+    proposed_exit_psm = st.number_input(
+        "Exit price (€/sqm)",
+        min_value=0.0,
+        value=float(max_exit_this_week),
+        step=10.0,
+        help="If you exceed the weekly cap, the sale is rejected immediately and this asset is blocked until next week.",
+    )
+
+    if proposed_exit_psm > max_exit_this_week:
+        block_until_next_week(holding.asset_id)
+        st.error(
+            f"Sale rejected: €{proposed_exit_psm:,.2f}/sqm exceeds this week's cap (€{max_exit_this_week:,.2f}/sqm). "
+            f"You must wait until week {st.session_state.sale_blocks[holding.asset_id]} to try again."
+        )
+        return
+
+    if st.button("Sell (whole asset)"):
+        proceeds = holding.sqm * proposed_exit_psm
+        st.session_state.cash += proceeds
+
+        # Return asset to market at new ask (available because it's no longer held)
+        asset = st.session_state.assets[holding.asset_id]
+        asset.ask_psm = proposed_exit_psm
+
+        st.session_state.portfolio.pop(holding.asset_id, None)
+        clear_block(holding.asset_id)
+
+        st.success(f"Sold **{holding.property_name}** at €{proposed_exit_psm:,.2f}/sqm for **€{proceeds:,.0f}**.")
+
+def week_controls():
+    st.subheader("Week Controls")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("End Week ➜"):
+            if st.session_state.current_week < END_WEEK:
+                st.session_state.current_week += 1
+                apply_curveball_effects(st.session_state.current_week)
+                st.success(f"Advanced to **Week {st.session_state.current_week}**.")
+            else:
+                st.info("You are at the final week.")
+    with col2:
+        if st.button("Reset Game"):
+            for k in ["assets", "portfolio", "cash", "current_week", "sale_blocks", "applied_curveballs"]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            init_state()
+            st.success("Game reset.")
+
+# ---------------------------
+# Main app
+# ---------------------------
 def main():
-    st.set_page_config(page_title="Madrid RE Portfolio — Bot", layout="wide")
-    st.title("🏢 Madrid Real Estate Portfolio — Class Game Bot")
-    st.caption("game by Innin Buyl — for exclusive use")
+    st.set_page_config(page_title="RE Portfolio Game — Madrid (50 Assets)", layout="wide")
+    init_state()
+    header()
 
-    init_db()
-    seed_data()
+    tabs = st.tabs(["Market", "Portfolio", "Buy", "Sell", "Week"])
 
-    # Login / team
-    colA, colB = st.columns([2,1])
-    with colB:
-        team_name = st.text_input("Your team name", value="Team A")
-        team = get_team(team_name)
-        st.success(f"Welcome, {team['team_name']} — Cash: €{team['cash']:,.0f}")
-        st.info(f"Current Week: {get_game_week()}")
-
-    tabs = st.tabs(["Information", "Market & Assets", "Trade", "Portfolio & KPIs", "Ask the Bot", "Instructor"])
-
-    # Information
     with tabs[0]:
-        st.subheader("How the game works — Information")
-        st.markdown(
-            """
-            **Columns explained (Assets Catalog):**
-            - **sector / subsector**: risk/lease structure & cycle sensitivity; affects exit yield (cap rate).
-            - **district**: submarket quality; informs rent/ERV assumptions.
-            - **size_sqm**: area you can buy; price = size × €/sqm.
-            - **year / condition**: newer/core assets are lower risk; value-add/opportunistic need capex.
-            - **vacancy %**: reduces effective income; impacts NOI and valuation.
-            - **ERV €/sqm/mo**: estimated market rent; higher ERV → higher potential NOI.
-            - **rent €/sqm/mo**: current passing rent; if below ERV, there’s upside on re-letting.
-            - **opex €/sqm/yr**: operating costs; higher opex lowers NOI and value.
-            - **capex_y1_pct / exp_capex_5y_psm**: expected investment; can lift ERV but needs cash.
-            - **price €/sqm**: guidance/ask. Final sale prices are **bounded by market bands** (see below).
-            - **status**: leased/vacant/value-add/dev readiness.
-
-            **Selling price rules:** You can’t pick any price. The app computes a **market fair €/sqm** from
-            NOI and a sector exit yield, then sets an **allowed band** ±10% around fair (adjusted by curveballs).
-            If your exit price is outside the band, it’s **auto-adjusted** to the nearest allowed price.
-
-            **Persistence:** Teams are saved in a local database. Use the **same team name** each week to load your book.
-            """
-        )
-
-    # Market & Assets
+        market_view()
     with tabs[1]:
-        st.subheader("Assets Catalog")
-        st.dataframe(list_assets(), use_container_width=True)
-        st.caption("Prices, ERVs and opex are simplified for the game.")
-
-    # Trade
+        portfolio_view()
     with tabs[2]:
-        st.subheader("Trade")
-        assets = list_assets()
-        asset = st.selectbox("Select asset", assets["asset_id"])
-        arow = assets[assets.asset_id == asset].iloc[0]
-        size = st.number_input("Size (sqm)", min_value=10.0, value=float(arow.size_sqm))
-        price_psm = st.number_input("Price (€/sqm)", min_value=100.0, value=float(arow.price_psm))
-        acq_cost_pct = st.number_input("Acq. costs (%)", min_value=0.0, max_value=0.1, value=0.03)
-        ltv_pct = st.number_input("LTV (%)", min_value=0.0, max_value=1.0, value=0.5)
-        if st.button("Buy Asset"):
-            buy_asset(team["team_id"], asset, size, price_psm, acq_cost_pct, ltv_pct)
-
-        st.markdown("### Open Positions")
-        pos = list_team_positions(team["team_id"])
-        st.dataframe(pos, use_container_width=True)
-        if len(pos) > 0:
-            sel = st.selectbox("Select position to sell", pos["position_id"].tolist())
-            try:
-                pos_row = pos[pos["position_id"] == sel].iloc[0]
-                band = get_market_price_band(pos_row["asset_id"])
-                st.info(f"Allowed market band: {band['lower']:,.0f}–{band['upper']:,.0f} €/sqm (fair ~ {band['fair']:,.0f})")
-                def_start = float(band['fair'])
-            except Exception:
-                def_start = float(arow.price_psm)
-            exit_psm = st.number_input("Exit price (€/sqm)", min_value=100.0, value=def_start)
-            if st.button("Sell Position"):
-                sell_position(int(sel), float(exit_psm))
-
-    # Portfolio & KPIs
+        buy_view()
     with tabs[3]:
-        st.subheader("Portfolio KPIs")
-        k = compute_kpis(team["team_id"])
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Portfolio Value (inc. cash)", f"€{k['portfolio_value']:,.0f}")
-        c2.metric("Equity", f"€{k['equity']:,.0f}")
-        c3.metric("Debt", f"€{k['debt']:,.0f}")
-        c4.metric("LTV", f"{k['ltv']*100:.1f}%")
-        c5.metric("NOI (approx)", f"€{k['noi']:,.0f} pa")
-        c6.metric("Cash", f"€{k['cash']:,.0f}")
-
-    # Ask the Bot
+        sell_view()
     with tabs[4]:
-        st.subheader("Ask the Bot")
-        q = st.text_input("Ask about assets, LTV, yields, or how to buy")
-        if st.button("Ask"):
-            st.write(qa_answer(q))
-
-    # Instructor
-    with tabs[5]:
-        st.subheader("Instructor Controls")
-        pwd = st.text_input("Admin password", type="password")
-        if pwd == ADMIN_PASS:
-            st.success("Admin verified")
-            week = st.number_input("Set current week", min_value=1, max_value=14, value=get_game_week())
-            if st.button("Update Week"):
-                set_game_week(int(week))
-                st.info("Week updated.")
-            st.markdown("### Apply curveball")
-            conn = get_conn()
-            dfc = pd.read_sql_query("SELECT * FROM curveballs", conn)
-            conn.close()
-            st.dataframe(dfc, use_container_width=True)
-            if st.button("Apply curveball for current week"):
-                cw = get_game_week()
-                title = dfc[dfc.week == cw]["title"].iloc[0]
-                # Implemented examples
-                if cw == 1:
-                    set_assumption("Euribor12M_%", get_assumption("Euribor12M_%") + 0.25)
-                if cw == 8:
-                    set_max_ltv(0.55)
-                st.warning(f"Curveball applied: {title}")
-
-            st.markdown("### 📊 Leaderboard (live)")
-            lb = compute_all_kpis()
-            st.dataframe(lb, use_container_width=True)
-
-            st.markdown("### 📑 All Open Positions")
-            st.dataframe(list_all_positions(), use_container_width=True)
-
-            st.markdown("### 🧾 Recent Transactions")
-            st.dataframe(list_transactions(200), use_container_width=True)
-
-            st.markdown("---")
-            st.markdown("### 🔒 Weekly Snapshot (lock scores)")
-            if st.button("Lock this week's snapshot"):
-                n = take_weekly_snapshot()
-                st.success(f"Locked {n} team snapshots for Week {get_game_week()}.")
-
-            sel_week = st.number_input("View snapshots for week", min_value=1, max_value=14, value=get_game_week())
-            snap = load_snapshots(int(sel_week))
-            st.dataframe(snap, use_container_width=True)
-            if not snap.empty:
-                csv_bytes = snap.to_csv(index=False).encode("utf-8")
-                st.download_button("Download snapshots CSV", data=csv_bytes, file_name=f"snapshots_week_{int(sel_week)}.csv", mime="text/csv")
-        else:
-            st.info("Enter admin password to manage the week, curveballs, and view the instructor dashboard.")
+        week_controls()
 
 if __name__ == "__main__":
     main()
