@@ -3,7 +3,7 @@
 #
 # Implements:
 # - 50 hardcoded Madrid assets (no randomness; deterministic)
-# - Initial cash: €10,000,000
+# - Initial cash: €36,000,000
 # - Whole-asset trades only (no partial sqm)
 # - Supply gating: an asset is unavailable while held; it returns to market only when sold
 # - Sale soft cap: 7% above entry €/sqm; exceeding it rejects the sale and blocks the asset until next week
@@ -26,7 +26,7 @@ import streamlit as st
 # Config
 # ---------------------------
 DB_PATH = "re_game.db"
-INITIAL_CASH = 10_000_000.0  # €10m budget
+INITIAL_CASH = 36_000_000.0  # €36m budget
 SALE_SOFT_CAP_FACTOR = 1.07  # +7%
 START_WEEK = 1
 END_WEEK = 14
