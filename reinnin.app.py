@@ -153,6 +153,9 @@ def init_db():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS assets (
+    # Add new columns (safe if they already exist)
+ensure_col(c, "assets", "passing_psm REAL")
+ensure_col(c, "assets", "vacancy_pct REAL")
         asset_id TEXT PRIMARY KEY,
         property_name TEXT,
         sector TEXT,
@@ -645,6 +648,64 @@ def instructor_view():
     st.markdown("### 🛒 Market (Availability)")
     st.dataframe(list_market(), use_container_width=True, hide_index=True)
 
+def classify_profile(location: str, sector: str) -> str:
+    prime = {"Salamanca","Chamberí","Centro","Chamartín","Retiro","Moncloa","Barajas"}
+    if location in prime:
+        return "Core"
+    if sector == "Logistics":
+        return "Core+"
+    return "Value-Add"
+
+def profile_factors(profile: str):
+    """
+    Returns (passing_rent_factor, vacancy_pct).
+    passing_rent_factor is applied to ERV €/sqm/month.
+    vacancy_pct is between 0 and 1.
+    """
+    if profile == "Core":
+        return 1.00, 0.04
+    if profile == "Core+":
+        return 0.92, 0.12
+    return 0.85, 0.25
+
+def patch_income_assumptions_once():
+    """
+    If passing_psm or vacancy_pct is missing, fill them using our profile rules.
+    Safe to run multiple times.
+    """
+    c = conn(); cur = c.cursor()
+    rows = cur.execute("SELECT asset_id, sector, location, erv_psm, passing_psm, vacancy_pct FROM assets").fetchall()
+    updated = 0
+    for asset_id, sector, location, erv_psm, passing_psm, vacancy_pct in rows:
+        if passing_psm is None or vacancy_pct is None:
+            prof = classify_profile(location, sector)
+            pass_factor, vac = profile_factors(prof)
+            new_passing = round(float(erv_psm) * pass_factor, 2)
+            cur.execute(
+                "UPDATE assets SET passing_psm=?, vacancy_pct=? WHERE asset_id=?",
+                (new_passing, vac, asset_id)
+            )
+            updated += 1
+    if updated:
+        c.commit()
+    c.close()
+
+def info_view():
+    st.subheader("Property Book — ROI Inputs")
+    c = conn()
+    df = pd.read_sql_query("""
+        SELECT asset_id, property_name, sector, location, sqm,
+               ask_psm, erv_psm, passing_psm, vacancy_pct, opex_psm, tax_psm
+        FROM assets
+        ORDER BY asset_id
+    """, c)
+    c.close()
+    # Make vacancy easy to read
+    df["vacancy_%"] = (df["vacancy_pct"]*100).round(0).astype(int)
+    df = df.drop(columns=["vacancy_pct"])
+    st.caption("Inputs for ROI: Ticket = ask_psm×sqm; Effective Gross Rent uses passing €/sqm/mo and vacancy.")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
 # ---------------------------
 # App entry
 # ---------------------------
@@ -652,6 +713,7 @@ def main():
     st.set_page_config(page_title="RE Portfolio Game — Madrid (50 Assets)", layout="wide")
     init_db()
     seed_assets_once()
+    patch_income_assumptions_once()
 
     header()
     tabs = st.tabs(["Market", "Portfolio", "Buy", "Sell", "Instructor"])
@@ -665,7 +727,10 @@ def main():
     with tabs[3]:
         sell_view()
     with tabs[4]:
+        info_view()
+    with tabs[5]:
         instructor_view()
+        
 
 if __name__ == "__main__":
     main()
