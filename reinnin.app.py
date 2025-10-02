@@ -1,5 +1,5 @@
 # re_game_app.py
-# Real Estate Portfolio Game — Madrid (50 Assets) with ROI inputs + Instructor reset
+# Real Estate Portfolio Game — Madrid (50 Assets) with ROI inputs + Instructor-only Week control
 # game by Innin Buyl — for exclusive use
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ INITIAL_CASH = 26_000_000.0  # €26m starting budget (edit if you like)
 SALE_SOFT_CAP_FACTOR = 1.07  # +7% over entry €/sqm
 START_WEEK = 1
 END_WEEK = 14
-ADMIN_PASS = "1nn1n"  # instructor password for reset
+ADMIN_PASS = "1nn1n"  # instructor password
 
 # ---------------------------
 # Curveballs (announcements + numeric effects, applied once per week)
@@ -299,7 +299,6 @@ def team_portfolio(name: str) -> pd.DataFrame:
 
 def add_holding(name: str, asset_id: str, entry_psm: float, buy_week: int):
     c = conn(); cur = c.cursor()
-    # fetch static fields from assets
     a = cur.execute("SELECT property_name, sector, location, sqm FROM assets WHERE asset_id=?", (asset_id,)).fetchone()
     property_name, sector, location, sqm = a
     cur.execute("""
@@ -350,11 +349,8 @@ def apply_curveball_effects(week: int):
     c = conn(); cur = c.cursor()
 
     if week == 2:
-        # Retail softness: ERV -5% for Retail
         cur.execute("UPDATE assets SET erv_psm = ROUND(erv_psm * 0.95, 2) WHERE sector='Retail'")
     elif week == 4:
-        # Bidding war: asking +7% for assets currently in market (not held)
-        # Get held asset_ids
         held_ids = [r[0] for r in cur.execute("SELECT DISTINCT asset_id FROM holdings").fetchall()]
         if held_ids:
             placeholders = ",".join(["?"]*len(held_ids))
@@ -362,20 +358,16 @@ def apply_curveball_effects(week: int):
         else:
             cur.execute("UPDATE assets SET ask_psm = ROUND(ask_psm * 1.07, 2)")
     elif week == 6:
-        # IBI/tax re-rate: taxes +3% for all
         cur.execute("UPDATE assets SET tax_psm = ROUND(tax_psm * 1.03, 2)")
     elif week == 7:
-        # Effective ERV -20% for Office & Retail (proxy)
         cur.execute("UPDATE assets SET erv_psm = ROUND(erv_psm * 0.80, 2) WHERE sector IN ('Office','Retail')")
     elif week == 9:
-        # Energy spike: opex +12%
         cur.execute("UPDATE assets SET opex_psm = ROUND(opex_psm * 1.12, 2)")
     elif week == 12:
-        # Residential demand: ERV +2%
         cur.execute("UPDATE assets SET erv_psm = ROUND(erv_psm * 1.02, 2) WHERE sector='Residential'")
 
-    # Recompute passing_psm after any ERV change (keep vacancy fixed)
-    if week in (2,7,12):
+    # Recompute passing_psm after ERV shifts
+    if week in (2, 7, 12):
         rows = cur.execute("SELECT asset_id, sector, location, erv_psm FROM assets").fetchall()
         for asset_id, sector, location, erv_psm in rows:
             prof = classify_profile(location, sector)
@@ -401,7 +393,6 @@ def header(name: str):
         cash = get_team_cash(st.session_state.name) if st.session_state.name else None
         st.metric("Cash (€)", f"{cash:,.0f}" if cash is not None else "—")
 
-    # Weekly announcement banner
     cb = CURVEBALLS.get(get_week())
     if cb:
         st.info(f"**This week’s curveball:** {cb}")
@@ -409,7 +400,6 @@ def header(name: str):
 def market_view():
     st.subheader("Market — Madrid")
     c = conn()
-    # Determine which assets are available (not held by anyone)
     held_df = pd.read_sql_query("SELECT DISTINCT asset_id FROM holdings", c)
     held_set = set(held_df["asset_id"].tolist())
     df = pd.read_sql_query("""
@@ -442,7 +432,6 @@ def buy_view():
     ensure_team(name)
     cash = get_team_cash(name)
     c = conn(); cur = c.cursor()
-    # Available assets = not in holdings
     held_ids = [r[0] for r in cur.execute("SELECT DISTINCT asset_id FROM holdings").fetchall()]
     if held_ids:
         placeholders = ",".join(["?"]*len(held_ids))
@@ -473,7 +462,6 @@ def buy_view():
         return
 
     if st.button("Buy (whole asset)"):
-        # Deduct cash, add holding at entry_psm = current ask
         set_team_cash(name, cash - ticket)
         add_holding(name, row.asset_id, float(row.ask_psm), get_week())
         st.success(f"Bought **{row.property_name}** for €{ticket:,.0f}.")
@@ -515,7 +503,6 @@ def sell_view():
 
     if st.button("Sell (whole asset)"):
         proceeds = float(h.sqm) * proposed_exit_psm
-        # Add cash, release asset back to market with new ask=exit price
         cash = get_team_cash(name)
         set_team_cash(name, cash + proceeds)
         c = conn(); cur = c.cursor()
@@ -524,26 +511,6 @@ def sell_view():
         remove_holding(name, h.asset_id)
         clear_block(name, h.asset_id)
         st.success(f"Sold **{h.property_name}** at €{proposed_exit_psm:,.2f}/sqm for **€{proceeds:,.0f}**.")
-
-def week_controls():
-    st.subheader("Week Controls")
-    current = get_week()
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("End Week ➜"):
-            if current < END_WEEK:
-                new_w = current + 1
-                set_week(new_w)
-                apply_curveball_effects(new_w)
-                st.success(f"Advanced to **Week {new_w}**.")
-            else:
-                st.info("You are at the final week.")
-    with col2:
-        if st.button("Reset My Session (UI only)"):
-            # Does not touch DB; just resets local Streamlit state
-            for k in list(st.session_state.keys()):
-                del st.session_state[k]
-            st.success("Session state cleared. Reload the page.")
 
 def info_view():
     st.subheader("Property Book — ROI Inputs")
@@ -568,17 +535,35 @@ def instructor_view():
         return
 
     st.success("Instructor mode enabled.")
-    # Show quick leaderboard (cash only; realized P&L proxy)
+    st.write("**Global Week:**", get_week())
+
+    # Week controls (INSTRUCTOR ONLY)
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("End Week ➜ (apply curveball if any)"):
+            current = get_week()
+            if current < END_WEEK:
+                new_w = current + 1
+                set_week(new_w)
+                apply_curveball_effects(new_w)
+                st.success(f"Advanced to **Week {new_w}**.")
+            else:
+                st.info("You are at the final week.")
+    with colB:
+        if st.button("Re-apply Curveball for Current Week (idempotent)"):
+            apply_curveball_effects(get_week())
+            st.success("Curveball logic run (no duplicates if already applied).")
+
+    st.divider()
+    # Quick leaderboard
     c = conn()
     teams = pd.read_sql_query("SELECT name, cash FROM teams ORDER BY cash DESC", c)
+    c.close()
     st.write("**Leaderboard (by cash on hand)**")
     if teams.empty:
         st.caption("No teams yet.")
     else:
         st.dataframe(teams, hide_index=True, use_container_width=True)
-
-    st.divider()
-    st.write("**Global Week:**", get_week())
 
     st.divider()
     st.write("⚠️ Reset tools")
@@ -591,8 +576,8 @@ def instructor_view():
             init_db()
             seed_assets_once()
             patch_income_assumptions_once()
-            apply_curveball_effects(START_WEEK)  # no-op but harmless
-            st.success("Database wiped and rebuilt. Page will reflect a fresh game on reload.")
+            apply_curveball_effects(START_WEEK)  # harmless no-op
+            st.success("Database wiped and rebuilt. Reload the page for a fresh game.")
         except Exception as e:
             st.error(f"Failed to reset DB: {e}")
 
@@ -606,6 +591,7 @@ def main():
     init_db()
     seed_assets_once()
     patch_income_assumptions_once()
+
     # Ensure we have a session-local team name field
     if "name" not in st.session_state:
         st.session_state.name = ""
@@ -613,8 +599,8 @@ def main():
     # Header
     header(st.session_state.name)
 
-    # Tabs
-    tabs = st.tabs(["Market", "Portfolio", "Buy", "Sell", "Info", "Week", "Instructor"])
+    # Tabs — NOTE: Week tab removed; week control is instructor-only
+    tabs = st.tabs(["Market", "Portfolio", "Buy", "Sell", "Info", "Instructor"])
 
     with tabs[0]:
         market_view()
@@ -627,8 +613,6 @@ def main():
     with tabs[4]:
         info_view()
     with tabs[5]:
-        week_controls()
-    with tabs[6]:
         instructor_view()
 
     st.markdown("<br/><hr/><center>game by Innin Buyl — for exclusive use</center>", unsafe_allow_html=True)
