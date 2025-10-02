@@ -1,5 +1,6 @@
 # re_game_app.py
-# Real Estate Portfolio Game — Madrid (50 Assets) with ROI inputs + Instructor-only Week control
+# Real Estate Portfolio Game — Madrid (50 Assets) with ROI inputs, Instructor-only Week control,
+# portfolio NOI/ROI view for Instructor, and weekly NOI accrual into team cash.
 # game by Innin Buyl — for exclusive use
 
 from __future__ import annotations
@@ -16,11 +17,12 @@ import streamlit as st
 # Config
 # ---------------------------
 DB_PATH = "re_game.db"
-INITIAL_CASH = 26_000_000.0  # €26m starting budget (edit if you like)
-SALE_SOFT_CAP_FACTOR = 1.07  # +7% over entry €/sqm
+INITIAL_CASH = 26_000_000.0      # €26m starting budget
+SALE_SOFT_CAP_FACTOR = 1.07      # +7% over entry €/sqm (sale cap)
 START_WEEK = 1
 END_WEEK = 14
-ADMIN_PASS = "1nn1n"  # instructor password
+ADMIN_PASS = "1nn1n"             # Instructor password
+NOI_ACCRUAL_DIVISOR = 52         # 52 = weekly accrual of annual NOI (change to 14 for "game-weeks")
 
 # ---------------------------
 # Curveballs (announcements + numeric effects, applied once per week)
@@ -66,7 +68,7 @@ ASSETS_DATA: List[dict] = [
     {"asset_id":"A002","property_name":"RES-MAD-CHAMART-02","sector":"Residential","location":"Chamartín","sqm":3500,"ask_psm":4800.0,"erv_psm":264.0,"opex_psm":24.0,"tax_psm":21.6},
     {"asset_id":"A003","property_name":"RES-MAD-CHAMBER-03","sector":"Residential","location":"Chamberí","sqm":3900,"ask_psm":5400.0,"erv_psm":291.6,"opex_psm":32.4,"tax_psm":27.0},
     {"asset_id":"A004","property_name":"RES-MAD-CENTRO-04","sector":"Residential","location":"Centro","sqm":2800,"ask_psm":5600.0,"erv_psm":308.0,"opex_psm":33.6,"tax_psm":28.0},
-    {"asset_id":"A005","property_name":"RES-MAD-RETIRO-05","sector":"Residential","location":"Retiro","sqm":3100,"ask_psm":5000.0,"erv_psm":285.0,"opex_psm":30.0,"tax_psm":25.0},
+    {"asset_id":"A005","property_name":"RES-MAD-RETIRO-05","sector":"Residential","location":"Retiro","sqm":3100,"ask_psm":5000.0,"erv_psm":285.0,"ope_psm":30.0,"tax_psm":25.0},
     {"asset_id":"A006","property_name":"RES-MAD-TETUAN-06","sector":"Residential","location":"Tetuán","sqm":4600,"ask_psm":3900.0,"erv_psm":195.0,"opex_psm":19.5,"tax_psm":15.6},
     {"asset_id":"A007","property_name":"RES-MAD-ARGANZ-07","sector":"Residential","location":"Arganzuela","sqm":5200,"ask_psm":3600.0,"erv_psm":172.8,"opex_psm":18.0,"tax_psm":14.4},
     {"asset_id":"A008","property_name":"RES-MAD-MONCLO-08","sector":"Residential","location":"Moncloa","sqm":2700,"ask_psm":4700.0,"erv_psm":246.8,"opex_psm":23.5,"tax_psm":18.8},
@@ -162,7 +164,7 @@ def init_db():
             cash REAL
         )
     """)
-    # holdings (global supply gating by presence in holdings)
+    # holdings
     cur.execute("""
         CREATE TABLE IF NOT EXISTS holdings (
             name TEXT,
@@ -176,7 +178,7 @@ def init_db():
             PRIMARY KEY (name, asset_id)
         )
     """)
-    # sale blocks for cap violations
+    # sale blocks (cap violations)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sale_blocks (
             name TEXT,
@@ -192,16 +194,15 @@ def init_db():
             current_week INTEGER
         )
     """)
-    # which curveballs already applied
+    # applied curveballs
     cur.execute("""
         CREATE TABLE IF NOT EXISTS applied_curveballs (
             week INTEGER PRIMARY KEY
         )
     """)
-    # initialize game week if not set
+    # initialize week
     cur.execute("INSERT OR IGNORE INTO game_state (id, current_week) VALUES (1, ?)", (START_WEEK,))
     c.commit()
-    # Ensure new columns exist if DB was old
     ensure_col(c, "assets", "passing_psm REAL")
     ensure_col(c, "assets", "vacancy_pct REAL")
     c.close()
@@ -285,15 +286,12 @@ def set_team_cash(name: str, cash: float):
     cur.execute("UPDATE teams SET cash=? WHERE name=?", (cash, name))
     c.commit(); c.close()
 
-def is_held_globally(asset_id: str) -> bool:
-    c = conn(); cur = c.cursor()
-    row = cur.execute("SELECT COUNT(*) FROM holdings WHERE asset_id=?", (asset_id,)).fetchone()
-    c.close()
-    return row[0] > 0
-
-def team_portfolio(name: str) -> pd.DataFrame:
+def team_portfolio_df(name: str) -> pd.DataFrame:
     c = conn()
-    df = pd.read_sql_query("SELECT asset_id, property_name, sector, location, sqm, entry_psm, buy_week FROM holdings WHERE name=? ORDER BY asset_id", c, params=(name,))
+    df = pd.read_sql_query("""
+        SELECT h.asset_id, h.property_name, h.sector, h.location, h.sqm, h.entry_psm, h.buy_week
+        FROM holdings h WHERE h.name=? ORDER BY h.asset_id
+    """, c, params=(name,))
     c.close()
     return df
 
@@ -342,6 +340,79 @@ def mark_curveball_applied(week: int):
     cur.execute("INSERT OR IGNORE INTO applied_curveballs (week) VALUES (?)", (week,))
     c.commit(); c.close()
 
+# ---------------------------
+# NOI & ROI calculations
+# ---------------------------
+def asset_noi_from_table(asset_row) -> float:
+    """
+    asset_row with columns: sqm, passing_psm, vacancy_pct, opex_psm, tax_psm
+    Returns ANNUAL NOI (€).
+    """
+    sqm = float(asset_row["sqm"])
+    passing = float(asset_row["passing_psm"])
+    vac = float(asset_row["vacancy_pct"])
+    opex_psm = float(asset_row["opex_psm"])
+    tax_psm = float(asset_row["tax_psm"])
+
+    occupied_sqm = sqm * (1.0 - vac)
+    effective_gross = passing * 12.0 * occupied_sqm  # €/sqm/mo * 12 * occ_sqm
+    opex_total = opex_psm * sqm
+    tax_total = tax_psm * sqm
+    noi = effective_gross - opex_total - tax_total
+    return float(round(noi, 2))
+
+def portfolio_metrics(name: str) -> Tuple[float, float, float]:
+    """
+    Returns (total_ticket, total_annual_noi, portfolio_roi)
+    total_ticket = sum(entry_psm * sqm) across holdings
+    total_annual_noi = sum(current-year NOI) using current asset parameters
+    portfolio_roi = NOI / ticket (None if ticket == 0)
+    """
+    c = conn()
+    # Join holdings with current assets for income params
+    df = pd.read_sql_query("""
+        SELECT h.asset_id, h.sqm, h.entry_psm,
+               a.passing_psm, a.vacancy_pct, a.opex_psm, a.tax_psm
+        FROM holdings h
+        JOIN assets a ON a.asset_id = h.asset_id
+        WHERE h.name=?
+    """, c, params=(name,))
+    c.close()
+    if df.empty:
+        return (0.0, 0.0, None)
+    df["ticket"] = df["entry_psm"] * df["sqm"]
+    df["noi"] = df.apply(asset_noi_from_table, axis=1)
+    total_ticket = float(df["ticket"].sum())
+    total_noi = float(df["noi"].sum())
+    roi = (total_noi / total_ticket) if total_ticket > 0 else None
+    return (round(total_ticket, 2), round(total_noi, 2), (round(roi, 6) if roi is not None else None))
+
+def accrue_weekly_income_all_teams():
+    """
+    Adds (annual NOI / NOI_ACCRUAL_DIVISOR) to each team's cash, based on
+    CURRENT asset parameters and CURRENT holdings at the moment of accrual.
+    """
+    c = conn()
+    teams = pd.read_sql_query("SELECT name, cash FROM teams", c)
+    c.close()
+    if teams.empty:
+        return 0, 0.0
+
+    teams_updated = 0
+    total_accrued = 0.0
+    for name in teams["name"].tolist():
+        ticket, annual_noi, _ = portfolio_metrics(name)
+        weekly = annual_noi / NOI_ACCRUAL_DIVISOR
+        if weekly != 0.0:
+            cash = get_team_cash(name) or 0.0
+            set_team_cash(name, cash + weekly)
+            teams_updated += 1
+            total_accrued += weekly
+    return teams_updated, round(total_accrued, 2)
+
+# ---------------------------
+# Curveballs application
+# ---------------------------
 def apply_curveball_effects(week: int):
     """Apply numeric effects exactly once per week to the assets table."""
     if curveball_applied(week):
@@ -349,8 +420,10 @@ def apply_curveball_effects(week: int):
     c = conn(); cur = c.cursor()
 
     if week == 2:
+        # Retail ERV -5%
         cur.execute("UPDATE assets SET erv_psm = ROUND(erv_psm * 0.95, 2) WHERE sector='Retail'")
     elif week == 4:
+        # Ask +7% on market assets (not held)
         held_ids = [r[0] for r in cur.execute("SELECT DISTINCT asset_id FROM holdings").fetchall()]
         if held_ids:
             placeholders = ",".join(["?"]*len(held_ids))
@@ -358,12 +431,16 @@ def apply_curveball_effects(week: int):
         else:
             cur.execute("UPDATE assets SET ask_psm = ROUND(ask_psm * 1.07, 2)")
     elif week == 6:
+        # Taxes +3%
         cur.execute("UPDATE assets SET tax_psm = ROUND(tax_psm * 1.03, 2)")
     elif week == 7:
+        # Office/Retail effective ERV shock: ERV -20% as proxy
         cur.execute("UPDATE assets SET erv_psm = ROUND(erv_psm * 0.80, 2) WHERE sector IN ('Office','Retail')")
     elif week == 9:
+        # Opex +12%
         cur.execute("UPDATE assets SET opex_psm = ROUND(opex_psm * 1.12, 2)")
     elif week == 12:
+        # Residential ERV +2%
         cur.execute("UPDATE assets SET erv_psm = ROUND(erv_psm * 1.02, 2) WHERE sector='Residential'")
 
     # Recompute passing_psm after ERV shifts
@@ -417,7 +494,7 @@ def portfolio_view():
     if not name:
         st.caption("Enter your team name above to view portfolio.")
         return
-    df = team_portfolio(name)
+    df = team_portfolio_df(name)
     if df.empty:
         st.caption("No holdings yet.")
         return
@@ -472,7 +549,7 @@ def sell_view():
     if not name:
         st.warning("Enter your team name above.")
         return
-    df = team_portfolio(name)
+    df = team_portfolio_df(name)
     if df.empty:
         st.caption("No holdings to sell.")
         return
@@ -527,6 +604,7 @@ def info_view():
     st.caption("Use these to calculate: Ticket, GPR, Effective Rent, Opex, Tax, NOI, ROI.")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+# ---------- Instructor ----------
 def instructor_view():
     st.subheader("Instructor — Admin")
     pw = st.text_input("Admin password", type="password")
@@ -537,38 +615,110 @@ def instructor_view():
     st.success("Instructor mode enabled.")
     st.write("**Global Week:**", get_week())
 
-    # Week controls (INSTRUCTOR ONLY)
-    colA, colB = st.columns(2)
+    # ---- Portfolio NOI/ROI snapshot (for math checking) ----
+    st.markdown("### Portfolio NOI & ROI by Team (current parameters)")
+    c = conn()
+    team_rows = pd.read_sql_query("SELECT name, cash FROM teams ORDER BY name", c)
+    c.close()
+
+    if team_rows.empty:
+        st.caption("No teams yet.")
+    else:
+        records = []
+        for _, r in team_rows.iterrows():
+            name = r["name"]
+            cash = float(r["cash"])
+            ticket, annual_noi, roi = portfolio_metrics(name)
+            weekly_noi = annual_noi / NOI_ACCRUAL_DIVISOR
+            records.append({
+                "Team": name,
+                "Cash (€)": round(cash, 2),
+                "Invested Ticket (€)": round(ticket, 2),
+                "Annual NOI (€)": round(annual_noi, 2),
+                f"Weekly NOI (€/÷{NOI_ACCRUAL_DIVISOR})": round(weekly_noi, 2),
+                "Portfolio ROI (NOI/Ticket)": (round(roi, 6) if roi is not None else None),
+            })
+        st.dataframe(pd.DataFrame(records).sort_values(by="Annual NOI (€)", ascending=False),
+                     hide_index=True, use_container_width=True)
+
+    with st.expander("Per-team holdings & calculated NOI (detail)"):
+        name_query = st.text_input("Filter by Team (optional)")
+        for _, r in team_rows.iterrows():
+            tname = r["name"]
+            if name_query and name_query.strip().lower() not in tname.lower():
+                continue
+            st.markdown(f"**Team: {tname}**")
+            # Join holdings+assets to show per-asset NOI math
+            c = conn()
+            df = pd.read_sql_query("""
+                SELECT h.asset_id, h.property_name, h.sector, h.location, h.sqm, h.entry_psm,
+                       a.passing_psm, a.vacancy_pct, a.opex_psm, a.tax_psm
+                FROM holdings h
+                JOIN assets a ON a.asset_id = h.asset_id
+                WHERE h.name=?
+                ORDER BY h.asset_id
+            """, c, params=(tname,))
+            c.close()
+            if df.empty:
+                st.caption("No holdings.")
+            else:
+                # Compute Annual NOI & Ticket columns for transparency
+                def calc_noi(rw):
+                    return asset_noi_from_table(rw)
+                df["Ticket (€)"] = (df["entry_psm"] * df["sqm"]).round(2)
+                df["Annual NOI (€)"] = df.apply(calc_noi, axis=1).round(2)
+                df["Vacancy %"] = (df["vacancy_pct"] * 100).round(0)
+                df_disp = df[[
+                    "asset_id","property_name","sector","location","sqm","entry_psm",
+                    "passing_psm","Vacancy %","opex_psm","tax_psm","Ticket (€)","Annual NOI (€)"
+                ]]
+                st.dataframe(df_disp, hide_index=True, use_container_width=True)
+
+    st.divider()
+    # ---- Week controls (accrual + advance week + curveball) ----
+    st.markdown("### Week control")
+    colA, colB, colC = st.columns(3)
     with colA:
-        if st.button("End Week ➜ (apply curveball if any)"):
+        if st.button("End Week ➜ (accrue income, then advance & apply curveball)"):
             current = get_week()
             if current < END_WEEK:
+                # 1) Accrue rent for all teams at current parameters
+                teams_updated, total_accrued = accrue_weekly_income_all_teams()
+                # 2) Advance week
                 new_w = current + 1
                 set_week(new_w)
+                # 3) Apply curveball for the NEW week
                 apply_curveball_effects(new_w)
-                st.success(f"Advanced to **Week {new_w}**.")
+                st.success(
+                    f"Accrued income for {teams_updated} team(s): +€{total_accrued:,.0f}. "
+                    f"Advanced to **Week {new_w}** and applied curveball if any."
+                )
             else:
                 st.info("You are at the final week.")
     with colB:
+        if st.button("Accrue Income Only (no week change)"):
+            teams_updated, total_accrued = accrue_weekly_income_all_teams()
+            st.success(f"Accrued income for {teams_updated} team(s): +€{total_accrued:,.0f}.")
+    with colC:
         if st.button("Re-apply Curveball for Current Week (idempotent)"):
             apply_curveball_effects(get_week())
             st.success("Curveball logic run (no duplicates if already applied).")
 
     st.divider()
-    # Quick leaderboard
+    # ---- Leaderboard (by cash on hand) ----
+    st.markdown("### Leaderboard (Cash on hand)")
     c = conn()
     teams = pd.read_sql_query("SELECT name, cash FROM teams ORDER BY cash DESC", c)
     c.close()
-    st.write("**Leaderboard (by cash on hand)**")
     if teams.empty:
         st.caption("No teams yet.")
     else:
         st.dataframe(teams, hide_index=True, use_container_width=True)
 
     st.divider()
-    st.write("⚠️ Reset tools")
+    # ---- Reset controls ----
+    st.markdown("### Reset tools")
     st.caption("Reset Entire Game wipes the database file and rebuilds everything (assets, week, teams, holdings). Use with caution.")
-
     if st.button("Reset Entire Game (wipe DB)"):
         try:
             if os.path.exists(DB_PATH):
@@ -599,7 +749,7 @@ def main():
     # Header
     header(st.session_state.name)
 
-    # Tabs — NOTE: Week tab removed; week control is instructor-only
+    # Tabs — (no player week tab; instructor controls week)
     tabs = st.tabs(["Market", "Portfolio", "Buy", "Sell", "Info", "Instructor"])
 
     with tabs[0]:
@@ -619,3 +769,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
