@@ -1,12 +1,17 @@
 # re_game_app.py
-# Real Estate Portfolio Game — Madrid (50 Assets) with ROI inputs, Instructor-only Week control,
-# portfolio NOI/ROI view for Instructor, and weekly NOI accrual into team cash.
+# Real Estate Portfolio Game — Madrid (50 Assets) with:
+# - ROI inputs (passing €/sqm/mo, vacancy %)
+# - Instructor-only week control + weekly NOI accrual to cash
+# - Instructor portfolio NOI/ROI snapshot (per team & per asset)
+# - Supply gating, sale soft cap, curveballs
+# - Robust SQLite init/reset for Streamlit Cloud
 # game by Innin Buyl — for exclusive use
 
 from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -22,7 +27,9 @@ SALE_SOFT_CAP_FACTOR = 1.07      # +7% over entry €/sqm (sale cap)
 START_WEEK = 1
 END_WEEK = 14
 ADMIN_PASS = "1nn1n"             # Instructor password
-NOI_ACCRUAL_DIVISOR = 52         # 52 = weekly accrual of annual NOI (change to 14 for "game-weeks")
+NOI_ACCRUAL_DIVISOR = 52         # 52 = weekly accrual of annual NOI
+
+DB_INIT_LOCK = threading.Lock()
 
 # ---------------------------
 # Curveballs (announcements + numeric effects, applied once per week)
@@ -68,7 +75,7 @@ ASSETS_DATA: List[dict] = [
     {"asset_id":"A002","property_name":"RES-MAD-CHAMART-02","sector":"Residential","location":"Chamartín","sqm":3500,"ask_psm":4800.0,"erv_psm":264.0,"opex_psm":24.0,"tax_psm":21.6},
     {"asset_id":"A003","property_name":"RES-MAD-CHAMBER-03","sector":"Residential","location":"Chamberí","sqm":3900,"ask_psm":5400.0,"erv_psm":291.6,"opex_psm":32.4,"tax_psm":27.0},
     {"asset_id":"A004","property_name":"RES-MAD-CENTRO-04","sector":"Residential","location":"Centro","sqm":2800,"ask_psm":5600.0,"erv_psm":308.0,"opex_psm":33.6,"tax_psm":28.0},
-    {"asset_id":"A005","property_name":"RES-MAD-RETIRO-05","sector":"Residential","location":"Retiro","sqm":3100,"ask_psm":5000.0,"erv_psm":285.0,"ope_psm":30.0,"tax_psm":25.0},
+    {"asset_id":"A005","property_name":"RES-MAD-RETIRO-05","sector":"Residential","location":"Retiro","sqm":3100,"ask_psm":5000.0,"erv_psm":285.0,"opex_psm":30.0,"tax_psm":25.0},
     {"asset_id":"A006","property_name":"RES-MAD-TETUAN-06","sector":"Residential","location":"Tetuán","sqm":4600,"ask_psm":3900.0,"erv_psm":195.0,"opex_psm":19.5,"tax_psm":15.6},
     {"asset_id":"A007","property_name":"RES-MAD-ARGANZ-07","sector":"Residential","location":"Arganzuela","sqm":5200,"ask_psm":3600.0,"erv_psm":172.8,"opex_psm":18.0,"tax_psm":14.4},
     {"asset_id":"A008","property_name":"RES-MAD-MONCLO-08","sector":"Residential","location":"Moncloa","sqm":2700,"ask_psm":4700.0,"erv_psm":246.8,"opex_psm":23.5,"tax_psm":18.8},
@@ -123,89 +130,66 @@ ASSETS_DATA: List[dict] = [
 ]
 
 # ---------------------------
-# DB helpers
+# DB helpers (robust for Streamlit Cloud)
 # ---------------------------
 def conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-def ensure_col(c, table: str, definition: str):
-    # definition like 'passing_psm REAL'
-    col = definition.split()[0]
-    cur = c.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]
-    if col not in cols:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
-        c.commit()
+    c = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10.0)
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    c.execute("PRAGMA foreign_keys=ON;")
+    return c
 
 def init_db():
-    c = conn()
-    cur = c.cursor()
-    # assets
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS assets (
-            asset_id TEXT PRIMARY KEY,
-            property_name TEXT,
-            sector TEXT,
-            location TEXT,
-            sqm INTEGER,
-            ask_psm REAL,
-            erv_psm REAL,
-            opex_psm REAL,
-            tax_psm REAL,
-            passing_psm REAL,
-            vacancy_pct REAL
-        )
-    """)
-    # teams
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS teams (
-            name TEXT PRIMARY KEY,
-            cash REAL
-        )
-    """)
-    # holdings
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS holdings (
-            name TEXT,
-            asset_id TEXT,
-            property_name TEXT,
-            sector TEXT,
-            location TEXT,
-            sqm INTEGER,
-            entry_psm REAL,
-            buy_week INTEGER,
-            PRIMARY KEY (name, asset_id)
-        )
-    """)
-    # sale blocks (cap violations)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sale_blocks (
-            name TEXT,
-            asset_id TEXT,
-            blocked_until_week INTEGER,
-            PRIMARY KEY (name, asset_id)
-        )
-    """)
-    # game state
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS game_state (
-            id INTEGER PRIMARY KEY,
-            current_week INTEGER
-        )
-    """)
-    # applied curveballs
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS applied_curveballs (
-            week INTEGER PRIMARY KEY
-        )
-    """)
-    # initialize week
-    cur.execute("INSERT OR IGNORE INTO game_state (id, current_week) VALUES (1, ?)", (START_WEEK,))
-    c.commit()
-    ensure_col(c, "assets", "passing_psm REAL")
-    ensure_col(c, "assets", "vacancy_pct REAL")
-    c.close()
+    with DB_INIT_LOCK:
+        c = conn()
+        try:
+            c.executescript("""
+            CREATE TABLE IF NOT EXISTS assets (
+                asset_id TEXT PRIMARY KEY,
+                property_name TEXT,
+                sector TEXT,
+                location TEXT,
+                sqm INTEGER,
+                ask_psm REAL,
+                erv_psm REAL,
+                opex_psm REAL,
+                tax_psm REAL,
+                passing_psm REAL,
+                vacancy_pct REAL
+            );
+            CREATE TABLE IF NOT EXISTS teams (
+                name TEXT PRIMARY KEY,
+                cash REAL
+            );
+            CREATE TABLE IF NOT EXISTS holdings (
+                name TEXT,
+                asset_id TEXT,
+                property_name TEXT,
+                sector TEXT,
+                location TEXT,
+                sqm INTEGER,
+                entry_psm REAL,
+                buy_week INTEGER,
+                PRIMARY KEY (name, asset_id)
+            );
+            CREATE TABLE IF NOT EXISTS sale_blocks (
+                name TEXT,
+                asset_id TEXT,
+                blocked_until_week INTEGER,
+                PRIMARY KEY (name, asset_id)
+            );
+            CREATE TABLE IF NOT EXISTS game_state (
+                id INTEGER PRIMARY KEY,
+                current_week INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS applied_curveballs (
+                week INTEGER PRIMARY KEY
+            );
+            """)
+            c.execute("INSERT OR IGNORE INTO game_state (id, current_week) VALUES (1, ?)", (START_WEEK,))
+            c.commit()
+        finally:
+            c.close()
 
 def seed_assets_once():
     c = conn()
@@ -369,7 +353,6 @@ def portfolio_metrics(name: str) -> Tuple[float, float, float]:
     portfolio_roi = NOI / ticket (None if ticket == 0)
     """
     c = conn()
-    # Join holdings with current assets for income params
     df = pd.read_sql_query("""
         SELECT h.asset_id, h.sqm, h.entry_psm,
                a.passing_psm, a.vacancy_pct, a.opex_psm, a.tax_psm
@@ -401,7 +384,7 @@ def accrue_weekly_income_all_teams():
     teams_updated = 0
     total_accrued = 0.0
     for name in teams["name"].tolist():
-        ticket, annual_noi, _ = portfolio_metrics(name)
+        _, annual_noi, _ = portfolio_metrics(name)
         weekly = annual_noi / NOI_ACCRUAL_DIVISOR
         if weekly != 0.0:
             cash = get_team_cash(name) or 0.0
@@ -615,7 +598,7 @@ def instructor_view():
     st.success("Instructor mode enabled.")
     st.write("**Global Week:**", get_week())
 
-    # ---- Portfolio NOI/ROI snapshot (for math checking) ----
+    # ---- Portfolio NOI/ROI snapshot ----
     st.markdown("### Portfolio NOI & ROI by Team (current parameters)")
     c = conn()
     team_rows = pd.read_sql_query("SELECT name, cash FROM teams ORDER BY name", c)
@@ -648,7 +631,6 @@ def instructor_view():
             if name_query and name_query.strip().lower() not in tname.lower():
                 continue
             st.markdown(f"**Team: {tname}**")
-            # Join holdings+assets to show per-asset NOI math
             c = conn()
             df = pd.read_sql_query("""
                 SELECT h.asset_id, h.property_name, h.sector, h.location, h.sqm, h.entry_psm,
@@ -662,11 +644,8 @@ def instructor_view():
             if df.empty:
                 st.caption("No holdings.")
             else:
-                # Compute Annual NOI & Ticket columns for transparency
-                def calc_noi(rw):
-                    return asset_noi_from_table(rw)
                 df["Ticket (€)"] = (df["entry_psm"] * df["sqm"]).round(2)
-                df["Annual NOI (€)"] = df.apply(calc_noi, axis=1).round(2)
+                df["Annual NOI (€)"] = df.apply(asset_noi_from_table, axis=1).round(2)
                 df["Vacancy %"] = (df["vacancy_pct"] * 100).round(0)
                 df_disp = df[[
                     "asset_id","property_name","sector","location","sqm","entry_psm",
@@ -721,13 +700,20 @@ def instructor_view():
     st.caption("Reset Entire Game wipes the database file and rebuilds everything (assets, week, teams, holdings). Use with caution.")
     if st.button("Reset Entire Game (wipe DB)"):
         try:
+            # Safely remove DB (rename trick avoids lock-on-delete on some platforms)
             if os.path.exists(DB_PATH):
-                os.remove(DB_PATH)
+                try:
+                    os.replace(DB_PATH, DB_PATH + ".bak")
+                    if os.path.exists(DB_PATH + ".bak"):
+                        os.remove(DB_PATH + ".bak")
+                except Exception:
+                    os.remove(DB_PATH)
+            # Rebuild fresh
             init_db()
             seed_assets_once()
             patch_income_assumptions_once()
             apply_curveball_effects(START_WEEK)  # harmless no-op
-            st.success("Database wiped and rebuilt. Reload the page for a fresh game.")
+            st.success("Database wiped and rebuilt. Reload the page for a fresh game (Week 1).")
         except Exception as e:
             st.error(f"Failed to reset DB: {e}")
 
@@ -769,4 +755,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
